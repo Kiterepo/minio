@@ -36,8 +36,10 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
+
+const logSubsys = "internodes"
 
 // DefaultTimeout - default REST timeout is 10 seconds.
 const DefaultTimeout = 10 * time.Second
@@ -284,11 +286,22 @@ func (c *Client) dumpHTTP(req *http.Request, resp *http.Response) {
 	return
 }
 
+// ErrClientClosed returned when *Client is closed.
+var ErrClientClosed = errors.New("rest client is closed")
+
 // Call - make a REST call with context.
 func (c *Client) Call(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
-	if !c.IsOnline() {
+	switch atomic.LoadInt32(&c.connected) {
+	case closed:
+		// client closed, this is usually a manual process
+		// so return a local error as client is closed
+		return nil, &NetworkError{Err: ErrClientClosed}
+	case offline:
+		// client offline, return last error captured.
 		return nil, &NetworkError{Err: c.LastError()}
 	}
+
+	// client is still connected, attempt the request.
 
 	// Shallow copy. We don't modify the *UserInfo, if set.
 	// All other fields are copied.
@@ -316,7 +329,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 				atomic.AddUint64(&globalStats.errs, 1)
 			}
 			if c.MarkOffline(err) {
-				logger.LogOnceIf(ctx, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
+				logger.LogOnceIf(ctx, logSubsys, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
 			}
 		}
 		return nil, &NetworkError{err}
@@ -340,7 +353,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 		// instead, see cmd/storage-rest-server.go for ideas.
 		if c.HealthCheckFn != nil && resp.StatusCode == http.StatusPreconditionFailed {
 			err = fmt.Errorf("Marking %s offline temporarily; caused by PreconditionFailed with drive ID mismatch", c.url.Host)
-			logger.LogOnceIf(ctx, err, c.url.Host)
+			logger.LogOnceIf(ctx, logSubsys, err, c.url.Host)
 			c.MarkOffline(err)
 		}
 		defer xhttp.DrainBody(resp.Body)
@@ -352,7 +365,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 					atomic.AddUint64(&globalStats.errs, 1)
 				}
 				if c.MarkOffline(err) {
-					logger.LogOnceIf(ctx, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
+					logger.LogOnceIf(ctx, logSubsys, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
 				}
 			}
 			return nil, err
@@ -391,8 +404,6 @@ func NewClient(uu *url.URL, tr http.RoundTripper, newAuthToken func(aud string) 
 	clnt := &Client{
 		httpClient:               &http.Client{Transport: tr},
 		url:                      u,
-		lastErr:                  err,
-		lastErrTime:              time.Now(),
 		newAuthToken:             newAuthToken,
 		connected:                connected,
 		lastConn:                 time.Now().UnixNano(),
@@ -400,6 +411,11 @@ func NewClient(uu *url.URL, tr http.RoundTripper, newAuthToken func(aud string) 
 		HealthCheckReconnectUnit: 200 * time.Millisecond,
 		HealthCheckTimeout:       time.Second,
 	}
+	if err != nil {
+		clnt.lastErr = err
+		clnt.lastErrTime = time.Now()
+	}
+
 	if clnt.HealthCheckFn != nil {
 		// make connection pre-emptively.
 		go clnt.HealthCheckFn()
@@ -466,7 +482,7 @@ func (c *Client) runHealthCheck() bool {
 					if atomic.CompareAndSwapInt32(&c.connected, offline, online) {
 						now := time.Now()
 						disconnected := now.Sub(c.LastConn())
-						logger.Event(context.Background(), "Client '%s' re-connected in %s", c.url.String(), disconnected)
+						logger.Event(context.Background(), "healthcheck", "Client '%s' re-connected in %s", c.url.String(), disconnected)
 						atomic.StoreInt64(&c.lastConn, now.UnixNano())
 					}
 					return

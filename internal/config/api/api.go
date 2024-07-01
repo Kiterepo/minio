@@ -21,12 +21,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // API sub-system constants
@@ -155,7 +156,7 @@ var (
 		},
 		config.KV{
 			Key:   apiObjectMaxVersions,
-			Value: "10000",
+			Value: "9223372036854775807",
 		},
 	}
 )
@@ -178,7 +179,7 @@ type Config struct {
 	GzipObjects                 bool          `json:"gzip_objects"`
 	RootAccess                  bool          `json:"root_access"`
 	SyncEvents                  bool          `json:"sync_events"`
-	ObjectMaxVersions           int           `json:"object_max_versions"`
+	ObjectMaxVersions           int64         `json:"object_max_versions"`
 }
 
 // UnmarshalJSON - Validate SS and RRS parity when unmarshalling JSON.
@@ -317,16 +318,20 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 
 	maxVerStr := env.Get(EnvAPIObjectMaxVersions, "")
 	if maxVerStr == "" {
-		maxVerStr = env.Get(EnvAPIObjectMaxVersionsLegacy, kvs.GetWithDefault(apiObjectMaxVersions, DefaultKVS))
+		maxVerStr = env.Get(EnvAPIObjectMaxVersionsLegacy, kvs.Get(apiObjectMaxVersions))
 	}
-	maxVersions, err := strconv.Atoi(maxVerStr)
-	if err != nil {
-		return cfg, err
+	if maxVerStr != "" {
+		maxVersions, err := strconv.ParseInt(maxVerStr, 10, 64)
+		if err != nil {
+			return cfg, err
+		}
+		if maxVersions <= 0 {
+			return cfg, fmt.Errorf("invalid object max versions value: %v", maxVersions)
+		}
+		cfg.ObjectMaxVersions = maxVersions
+	} else {
+		cfg.ObjectMaxVersions = math.MaxInt64
 	}
-	if maxVersions <= 0 {
-		return cfg, fmt.Errorf("invalid object max versions value: %v", maxVersions)
-	}
-	cfg.ObjectMaxVersions = maxVersions
 
 	return cfg, nil
 }

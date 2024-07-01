@@ -61,7 +61,9 @@ const (
 	ObjectTransitionFailed
 	ObjectTransitionComplete
 	ObjectManyVersions
+	ObjectLargeVersions
 	PrefixManyFolders
+	ILMDelMarkerExpirationDelete
 
 	objectSingleTypesEnd
 	// Start Compound types that require expansion:
@@ -124,6 +126,7 @@ func (name Name) Expand() []Name {
 	case ObjectScannerAll:
 		return []Name{
 			ObjectManyVersions,
+			ObjectLargeVersions,
 			PrefixManyFolders,
 		}
 	case Everything:
@@ -197,6 +200,8 @@ func (name Name) String() string {
 		return "s3:ObjectRemoved:NoOP"
 	case ObjectRemovedDeleteAllVersions:
 		return "s3:ObjectRemoved:DeleteAllVersions"
+	case ILMDelMarkerExpirationDelete:
+		return "s3:LifecycleDelMarkerExpiration:Delete"
 	case ObjectReplicationAll:
 		return "s3:Replication:*"
 	case ObjectReplicationFailed:
@@ -223,6 +228,9 @@ func (name Name) String() string {
 		return "s3:ObjectTransition:Complete"
 	case ObjectManyVersions:
 		return "s3:Scanner:ManyVersions"
+	case ObjectLargeVersions:
+		return "s3:Scanner:LargeVersions"
+
 	case PrefixManyFolders:
 		return "s3:Scanner:BigPrefix"
 	}
@@ -319,6 +327,8 @@ func ParseName(s string) (Name, error) {
 		return ObjectRemovedNoOP, nil
 	case "s3:ObjectRemoved:DeleteAllVersions":
 		return ObjectRemovedDeleteAllVersions, nil
+	case "s3:LifecycleDelMarkerExpiration:Delete":
+		return ILMDelMarkerExpirationDelete, nil
 	case "s3:Replication:*":
 		return ObjectReplicationAll, nil
 	case "s3:Replication:OperationFailedReplication":
@@ -345,6 +355,8 @@ func ParseName(s string) (Name, error) {
 		return ObjectTransitionAll, nil
 	case "s3:Scanner:ManyVersions":
 		return ObjectManyVersions, nil
+	case "s3:Scanner:LargeVersions":
+		return ObjectLargeVersions, nil
 	case "s3:Scanner:BigPrefix":
 		return PrefixManyFolders, nil
 	default:

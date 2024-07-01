@@ -179,8 +179,9 @@ type DeleteBucketOptions struct {
 
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
-	Deleted bool // true only when site replication is enabled
-	Cached  bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	Deleted    bool // true only when site replication is enabled
+	Cached     bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	NoMetadata bool
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -244,6 +245,7 @@ type ObjectLayer interface {
 	Shutdown(context.Context) error
 	NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
 	BackendInfo() madmin.BackendInfo
+	Legacy() bool // Only returns true for deployments which use CRCMOD as its object distribution algorithm.
 	StorageInfo(ctx context.Context, metrics bool) StorageInfo
 	LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo
 
@@ -256,7 +258,7 @@ type ObjectLayer interface {
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
 	ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (result ListObjectVersionsInfo, err error)
 	// Walk lists all objects including versions, delete markers.
-	Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts WalkOptions) error
+	Walk(ctx context.Context, bucket, prefix string, results chan<- itemOrErr[ObjectInfo], opts WalkOptions) error
 
 	// Object operations.
 

@@ -24,8 +24,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/minio/pkg/v2/env"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger/target/http"
@@ -299,7 +299,7 @@ func lookupLegacyConfigForSubSys(ctx context.Context, subSys string) Config {
 			}
 			url, err := xnet.ParseHTTPURL(endpoint)
 			if err != nil {
-				LogOnceIf(ctx, err, "logger-webhook-"+endpoint)
+				LogOnceIf(ctx, "logging", err, "logger-webhook-"+endpoint)
 				continue
 			}
 			cfg.HTTP[target] = http.Config{
@@ -327,7 +327,7 @@ func lookupLegacyConfigForSubSys(ctx context.Context, subSys string) Config {
 			}
 			url, err := xnet.ParseHTTPURL(endpoint)
 			if err != nil {
-				LogOnceIf(ctx, err, "audit-webhook-"+endpoint)
+				LogOnceIf(ctx, "logging", err, "audit-webhook-"+endpoint)
 				continue
 			}
 			cfg.AuditWebhook[target] = http.Config{

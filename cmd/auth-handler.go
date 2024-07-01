@@ -41,7 +41,7 @@ import (
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Verify if request has JWT.
@@ -126,7 +126,7 @@ func getRequestAuthType(r *http.Request) (at authType) {
 		var err error
 		r.Form, err = url.ParseQuery(r.URL.RawQuery)
 		if err != nil {
-			logger.LogIf(r.Context(), err)
+			authNLogIf(r.Context(), err)
 			return authTypeUnknown
 		}
 	}
@@ -178,7 +178,7 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 
 	logger.GetReqInfo(ctx).Cred = cred
 	logger.GetReqInfo(ctx).Owner = owner
-	logger.GetReqInfo(ctx).Region = globalSite.Region
+	logger.GetReqInfo(ctx).Region = globalSite.Region()
 
 	return cred, owner, ErrNone
 }
@@ -257,7 +257,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 		if err != nil {
 			// Base64 decoding fails, we should log to indicate
 			// something is malforming the request sent by client.
-			logger.LogIf(GlobalContext, err, logger.ErrorKind)
+			authNLogIf(GlobalContext, err, logger.ErrorKind)
 			return nil, errAuthentication
 		}
 		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
@@ -353,7 +353,7 @@ func checkRequestAuthTypeWithVID(ctx context.Context, r *http.Request, action po
 
 func authenticateRequest(ctx context.Context, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
 	if logger.GetReqInfo(ctx) == nil {
-		logger.LogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.ErrorKind)
+		bugLogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.ErrorKind)
 		return ErrAccessDenied
 	}
 
@@ -368,7 +368,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypeSigned, authTypePresigned:
-		region := globalSite.Region
+		region := globalSite.Region()
 		switch action {
 		case policy.GetBucketLocationAction, policy.ListAllMyBucketsAction:
 			region = ""
@@ -384,7 +384,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 
 	logger.GetReqInfo(ctx).Cred = cred
 	logger.GetReqInfo(ctx).Owner = owner
-	logger.GetReqInfo(ctx).Region = globalSite.Region
+	logger.GetReqInfo(ctx).Region = globalSite.Region()
 
 	// region is valid only for CreateBucketAction.
 	var region string
@@ -392,7 +392,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 		// To extract region from XML in request body, get copy of request body.
 		payload, err := io.ReadAll(io.LimitReader(r.Body, maxLocationConstraintSize))
 		if err != nil {
-			logger.LogIf(ctx, err, logger.ErrorKind)
+			authZLogIf(ctx, err, logger.ErrorKind)
 			return ErrMalformedXML
 		}
 
@@ -684,7 +684,7 @@ func validateSignature(atype authType, r *http.Request) (auth.Credentials, bool,
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypePresigned, authTypeSigned:
-		region := globalSite.Region
+		region := globalSite.Region()
 		if s3Err = isReqAuthenticated(GlobalContext, r, region, serviceS3); s3Err != ErrNone {
 			return cred, owner, s3Err
 		}
@@ -745,7 +745,7 @@ func isPutRetentionAllowed(bucketName, objectName string, retDays int, retDate t
 func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectName string, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
 	var cred auth.Credentials
 	var owner bool
-	region := globalSite.Region
+	region := globalSite.Region()
 	switch atype {
 	case authTypeUnknown:
 		return ErrSignatureVersionNotSupported

@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/grid"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 //go:generate msgp -file=$GOFILE
@@ -31,6 +33,8 @@ type DeleteOptions struct {
 	Recursive bool `msg:"r"`
 	Immediate bool `msg:"i"`
 	UndoWrite bool `msg:"u"`
+	// OldDataDir of the previous object
+	OldDataDir string `msg:"o,omitempty"` // old data dir used only when to revert a rename()
 }
 
 // BaseOptions represents common options for all Storage API calls
@@ -150,6 +154,15 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 	if f == nil || v == "" {
 		return -1
 	}
+	if v == nullVersionID {
+		for i, ver := range f.Versions {
+			if ver.VersionID == "" {
+				return i
+			}
+		}
+		return -1
+	}
+
 	for i, ver := range f.Versions {
 		if ver.VersionID == v {
 			return i
@@ -433,6 +446,27 @@ type RenameDataHandlerParams struct {
 	Opts      RenameOptions `msg:"ro"`
 }
 
+// RenameDataInlineHandlerParams are parameters for RenameDataHandler with a buffer for inline data.
+type RenameDataInlineHandlerParams struct {
+	RenameDataHandlerParams `msg:"p"`
+}
+
+func newRenameDataInlineHandlerParams() *RenameDataInlineHandlerParams {
+	buf := grid.GetByteBufferCap(32 + 16<<10)
+	return &RenameDataInlineHandlerParams{RenameDataHandlerParams{FI: FileInfo{Data: buf[:0]}}}
+}
+
+// Recycle will reuse the memory allocated for the FileInfo data.
+func (r *RenameDataInlineHandlerParams) Recycle() {
+	if r == nil {
+		return
+	}
+	if cap(r.FI.Data) >= xioutil.SmallBlock {
+		grid.PutByteBuffer(r.FI.Data)
+		r.FI.Data = nil
+	}
+}
+
 // RenameFileHandlerParams are parameters for RenameFileHandler.
 type RenameFileHandlerParams struct {
 	DiskID      string `msg:"id"`
@@ -458,8 +492,31 @@ type WriteAllHandlerParams struct {
 }
 
 // RenameDataResp - RenameData()'s response.
+// Provides information about the final state of Rename()
+//   - on xl.meta (array of versions) on disk to check for version disparity
+//   - on rewrite dataDir on disk that must be additionally purged
+//     only after as a 2-phase call, allowing the older dataDir to
+//     hang-around in-case we need some form of recovery.
 type RenameDataResp struct {
-	Signature uint64 `msg:"sig"`
+	Sign       []byte
+	OldDataDir string // contains '<uuid>', it is designed to be passed as value to Delete(bucket, pathJoin(object, dataDir))
+}
+
+const (
+	checkPartUnknown int = iota
+
+	// Changing the order can cause a data loss
+	// when running two nodes with incompatible versions
+	checkPartSuccess
+	checkPartDiskNotFound
+	checkPartVolumeNotFound
+	checkPartFileNotFound
+	checkPartFileCorrupt
+)
+
+// CheckPartsResp is a response of the storage CheckParts and VerifyFile APIs
+type CheckPartsResp struct {
+	Results []int
 }
 
 // LocalDiskIDs - GetLocalIDs response.

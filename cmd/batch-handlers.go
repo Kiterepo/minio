@@ -48,11 +48,10 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/env"
-	"github.com/minio/pkg/v2/policy"
-	"github.com/minio/pkg/v2/workers"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/policy"
+	"github.com/minio/pkg/v3/workers"
 	"gopkg.in/yaml.v3"
 )
 
@@ -92,7 +91,7 @@ func notifyEndpoint(ctx context.Context, ri *batchJobInfo, endpoint, token strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	clnt := http.Client{Transport: getRemoteInstanceTransport}
+	clnt := http.Client{Transport: getRemoteInstanceTransport()}
 	resp, err := clnt.Do(req)
 	if err != nil {
 		return err
@@ -206,7 +205,7 @@ func (r *BatchJobReplicateV1) copyWithMultipartfromSource(ctx context.Context, a
 				if aerr == nil {
 					return
 				}
-				logger.LogIf(ctx,
+				batchLogIf(ctx,
 					fmt.Errorf("trying %s: Unable to cleanup failed multipart replication %s on remote %s/%s: %w - this may consume space on remote cluster",
 						humanize.Ordinal(attempts), res.UploadID, tgtBucket, tgtObject, aerr))
 				attempts++
@@ -351,7 +350,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	c, err := miniogo.New(u.Host, &miniogo.Options{
 		Creds:        credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken),
 		Secure:       u.Scheme == "https",
-		Transport:    getRemoteInstanceTransport,
+		Transport:    getRemoteInstanceTransport(),
 		BucketLookup: lookupStyle(r.Source.Path),
 	})
 	if err != nil {
@@ -402,7 +401,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 					} else {
 						if !isErrMethodNotAllowed(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) &&
 							!isErrObjectNotFound(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) {
-							logger.LogIf(ctx, err)
+							batchLogIf(ctx, err)
 						}
 						continue
 					}
@@ -414,7 +413,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 					} else {
 						if !isErrMethodNotAllowed(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) &&
 							!isErrObjectNotFound(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) {
-							logger.LogIf(ctx, err)
+							batchLogIf(ctx, err)
 						}
 						continue
 					}
@@ -443,15 +442,15 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 						return
 					}
 					stopFn(oi, err)
-					logger.LogIf(ctx, err)
+					batchLogIf(ctx, err)
 					success = false
 				} else {
 					stopFn(oi, nil)
 				}
-				ri.trackCurrentBucketObject(r.Target.Bucket, oi, success)
+				ri.trackCurrentBucketObject(r.Target.Bucket, oi, success, attempts)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
-				logger.LogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 
 				if wait := globalBatchConfig.ReplicationWait(); wait > 0 {
 					time.Sleep(wait)
@@ -466,10 +465,10 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 
 		globalBatchJobsMetrics.save(job.ID, ri)
 		// persist in-memory state to disk.
-		logger.LogIf(ctx, ri.updateAfter(ctx, api, 0, job))
+		batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 
 		if err := r.Notify(ctx, ri); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("unable to notify %v", err))
+			batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
 		}
 
 		cancel()
@@ -553,7 +552,7 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 					VersionID: entry.VersionID,
 				})
 			if err != nil {
-				logger.LogIf(ctx, err)
+				batchLogIf(ctx, err)
 				continue
 			}
 
@@ -572,7 +571,7 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 
 			opts, err := batchReplicationOpts(ctx, "", gr.ObjInfo)
 			if err != nil {
-				logger.LogIf(ctx, err)
+				batchLogIf(ctx, err)
 				continue
 			}
 
@@ -691,6 +690,7 @@ type batchJobInfo struct {
 	StartTime     time.Time `json:"startTime" msg:"st"`
 	LastUpdate    time.Time `json:"lastUpdate" msg:"lu"`
 	RetryAttempts int       `json:"retryAttempts" msg:"ra"`
+	Attempts      int       `json:"attempts" msg:"at"`
 
 	Complete bool `json:"complete" msg:"cmp"`
 	Failed   bool `json:"failed" msg:"fld"`
@@ -834,13 +834,15 @@ func (ri *batchJobInfo) clone() *batchJobInfo {
 		ObjectsFailed:    ri.ObjectsFailed,
 		BytesTransferred: ri.BytesTransferred,
 		BytesFailed:      ri.BytesFailed,
+		Attempts:         ri.Attempts,
 	}
 }
 
-func (ri *batchJobInfo) countItem(size int64, dmarker, success bool) {
+func (ri *batchJobInfo) countItem(size int64, dmarker, success bool, attempt int) {
 	if ri == nil {
 		return
 	}
+	ri.Attempts++
 	if success {
 		if dmarker {
 			ri.DeleteMarkers++
@@ -848,7 +850,19 @@ func (ri *batchJobInfo) countItem(size int64, dmarker, success bool) {
 			ri.Objects++
 			ri.BytesTransferred += size
 		}
+		if attempt > 1 {
+			if dmarker {
+				ri.DeleteMarkersFailed--
+			} else {
+				ri.ObjectsFailed--
+				ri.BytesFailed += size
+			}
+		}
 	} else {
+		if attempt > 1 {
+			// Only count first attempt
+			return
+		}
 		if dmarker {
 			ri.DeleteMarkersFailed++
 		} else {
@@ -922,7 +936,7 @@ func (ri *batchJobInfo) trackMultipleObjectVersions(bucket string, info ObjectIn
 	}
 }
 
-func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo, success bool) {
+func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo, success bool, attempt int) {
 	if ri == nil {
 		return
 	}
@@ -932,7 +946,7 @@ func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo,
 
 	ri.Bucket = bucket
 	ri.Object = info.Name
-	ri.countItem(info.Size, info.DeleteMarker, success)
+	ri.countItem(info.Size, info.DeleteMarker, success, attempt)
 }
 
 func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInfo) {
@@ -946,7 +960,7 @@ func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInf
 	ri.Bucket = bucket
 	for i := range batch {
 		ri.Object = batch[i].Name
-		ri.countItem(batch[i].Size, batch[i].DeleteMarker, true)
+		ri.countItem(batch[i].Size, batch[i].DeleteMarker, true, 1)
 	}
 }
 
@@ -1048,7 +1062,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	c, err := miniogo.NewCore(u.Host, &miniogo.Options{
 		Creds:        credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken),
 		Secure:       u.Scheme == "https",
-		Transport:    getRemoteInstanceTransport,
+		Transport:    getRemoteInstanceTransport(),
 		BucketLookup: lookupStyle(r.Target.Path),
 	})
 	if err != nil {
@@ -1057,86 +1071,84 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 
-	var (
-		walkCh = make(chan ObjectInfo, 100)
-		slowCh = make(chan ObjectInfo, 100)
-	)
-
-	if !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
-		go func() {
-			// Snowball currently needs the high level minio-go Client, not the Core one
-			cl, err := miniogo.New(u.Host, &miniogo.Options{
-				Creds:        credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken),
-				Secure:       u.Scheme == "https",
-				Transport:    getRemoteInstanceTransport,
-				BucketLookup: lookupStyle(r.Target.Path),
-			})
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return
-			}
-
-			// Already validated before arriving here
-			smallerThan, _ := humanize.ParseBytes(*r.Source.Snowball.SmallerThan)
-
-			batch := make([]ObjectInfo, 0, *r.Source.Snowball.Batch)
-			writeFn := func(batch []ObjectInfo) {
-				if len(batch) > 0 {
-					if err := r.writeAsArchive(ctx, api, cl, batch); err != nil {
-						logger.LogIf(ctx, err)
-						for _, b := range batch {
-							slowCh <- b
-						}
-					} else {
-						ri.trackCurrentBucketBatch(r.Source.Bucket, batch)
-						globalBatchJobsMetrics.save(job.ID, ri)
-						// persist in-memory state to disk after every 10secs.
-						logger.LogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
-					}
-				}
-			}
-			for obj := range walkCh {
-				if obj.DeleteMarker || !obj.VersionPurgeStatus.Empty() || obj.Size >= int64(smallerThan) {
-					slowCh <- obj
-					continue
-				}
-
-				batch = append(batch, obj)
-
-				if len(batch) < *r.Source.Snowball.Batch {
-					continue
-				}
-				writeFn(batch)
-				batch = batch[:0]
-			}
-			writeFn(batch)
-			xioutil.SafeClose(slowCh)
-		}()
-	} else {
-		slowCh = walkCh
-	}
-
-	workerSize, err := strconv.Atoi(env.Get("_MINIO_BATCH_REPLICATION_WORKERS", strconv.Itoa(runtime.GOMAXPROCS(0)/2)))
-	if err != nil {
-		return err
-	}
-
-	wk, err := workers.New(workerSize)
-	if err != nil {
-		// invalid worker size.
-		return err
-	}
-
-	walkQuorum := env.Get("_MINIO_BATCH_REPLICATION_WALK_QUORUM", "strict")
-	if walkQuorum == "" {
-		walkQuorum = "strict"
-	}
-
 	retryAttempts := ri.RetryAttempts
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
 		attempts := attempts
+		var (
+			walkCh = make(chan itemOrErr[ObjectInfo], 100)
+			slowCh = make(chan itemOrErr[ObjectInfo], 100)
+		)
 
+		if !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
+			go func() {
+				// Snowball currently needs the high level minio-go Client, not the Core one
+				cl, err := miniogo.New(u.Host, &miniogo.Options{
+					Creds:        credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken),
+					Secure:       u.Scheme == "https",
+					Transport:    getRemoteInstanceTransport(),
+					BucketLookup: lookupStyle(r.Target.Path),
+				})
+				if err != nil {
+					batchLogIf(ctx, err)
+					return
+				}
+
+				// Already validated before arriving here
+				smallerThan, _ := humanize.ParseBytes(*r.Source.Snowball.SmallerThan)
+
+				batch := make([]ObjectInfo, 0, *r.Source.Snowball.Batch)
+				writeFn := func(batch []ObjectInfo) {
+					if len(batch) > 0 {
+						if err := r.writeAsArchive(ctx, api, cl, batch); err != nil {
+							batchLogIf(ctx, err)
+							for _, b := range batch {
+								slowCh <- itemOrErr[ObjectInfo]{Item: b}
+							}
+						} else {
+							ri.trackCurrentBucketBatch(r.Source.Bucket, batch)
+							globalBatchJobsMetrics.save(job.ID, ri)
+							// persist in-memory state to disk after every 10secs.
+							batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+						}
+					}
+				}
+				for obj := range walkCh {
+					if obj.Item.DeleteMarker || !obj.Item.VersionPurgeStatus.Empty() || obj.Item.Size >= int64(smallerThan) {
+						slowCh <- obj
+						continue
+					}
+
+					batch = append(batch, obj.Item)
+
+					if len(batch) < *r.Source.Snowball.Batch {
+						continue
+					}
+					writeFn(batch)
+					batch = batch[:0]
+				}
+				writeFn(batch)
+				xioutil.SafeClose(slowCh)
+			}()
+		} else {
+			slowCh = walkCh
+		}
+
+		workerSize, err := strconv.Atoi(env.Get("_MINIO_BATCH_REPLICATION_WORKERS", strconv.Itoa(runtime.GOMAXPROCS(0)/2)))
+		if err != nil {
+			return err
+		}
+
+		wk, err := workers.New(workerSize)
+		if err != nil {
+			// invalid worker size.
+			return err
+		}
+
+		walkQuorum := env.Get("_MINIO_BATCH_REPLICATION_WALK_QUORUM", "strict")
+		if walkQuorum == "" {
+			walkQuorum = "strict"
+		}
 		ctx, cancel := context.WithCancel(ctx)
 		// one of source/target is s3, skip delete marker and all versions under the same object name.
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
@@ -1154,8 +1166,13 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		prevObj := ""
 
 		skipReplicate := false
-		for result := range slowCh {
-			result := result
+		for res := range slowCh {
+			if res.Err != nil {
+				ri.Failed = true
+				batchLogIf(ctx, res.Err)
+				continue
+			}
+			result := res.Item
 			if result.Name != prevObj {
 				prevObj = result.Name
 				skipReplicate = result.DeleteMarker && s3Type
@@ -1179,15 +1196,15 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 						return
 					}
 					stopFn(result, err)
-					logger.LogIf(ctx, err)
+					batchLogIf(ctx, err)
 					success = false
 				} else {
 					stopFn(result, nil)
 				}
-				ri.trackCurrentBucketObject(r.Source.Bucket, result, success)
+				ri.trackCurrentBucketObject(r.Source.Bucket, result, success, attempts)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
-				logger.LogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 
 				if wait := globalBatchConfig.ReplicationWait(); wait > 0 {
 					time.Sleep(wait)
@@ -1202,10 +1219,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 		globalBatchJobsMetrics.save(job.ID, ri)
 		// persist in-memory state to disk.
-		logger.LogIf(ctx, ri.updateAfter(ctx, api, 0, job))
+		batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 
 		if err := r.Notify(ctx, ri); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("unable to notify %v", err))
+			batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
 		}
 
 		cancel()
@@ -1232,6 +1249,7 @@ type batchReplicationJobError struct {
 	Code           string
 	Description    string
 	HTTPStatusCode int
+	ObjectSize     int64
 }
 
 func (e batchReplicationJobError) Error() string {
@@ -1248,9 +1266,18 @@ func (r *BatchJobReplicateV1) Validate(ctx context.Context, job BatchJobRequest,
 		return errInvalidArgument
 	}
 
-	if r.Source.Bucket == "" {
+	if r.Source.Endpoint != "" && r.Target.Endpoint != "" {
 		return errInvalidArgument
 	}
+
+	if r.Source.Creds.Empty() && r.Target.Creds.Empty() {
+		return errInvalidArgument
+	}
+
+	if r.Source.Bucket == "" || r.Target.Bucket == "" {
+		return errInvalidArgument
+	}
+
 	var isRemoteToLocal bool
 	localBkt := r.Source.Bucket
 	if r.Source.Endpoint != "" {
@@ -1275,9 +1302,6 @@ func (r *BatchJobReplicateV1) Validate(ctx context.Context, job BatchJobRequest,
 	if err := r.Source.Snowball.Validate(); err != nil {
 		return err
 	}
-	if r.Source.Creds.Empty() && r.Target.Creds.Empty() {
-		return errInvalidArgument
-	}
 
 	if !r.Source.Creds.Empty() {
 		if err := r.Source.Creds.Validate(); err != nil {
@@ -1299,18 +1323,11 @@ func (r *BatchJobReplicateV1) Validate(ctx context.Context, job BatchJobRequest,
 	if r.Target.Endpoint != "" && !r.Target.Type.isMinio() && !r.Target.ValidPath() {
 		return errInvalidArgument
 	}
-	if r.Target.Bucket == "" {
-		return errInvalidArgument
-	}
 
 	if !r.Target.Creds.Empty() {
 		if err := r.Target.Creds.Validate(); err != nil {
 			return err
 		}
-	}
-
-	if r.Source.Creds.Empty() && r.Target.Creds.Empty() {
-		return errInvalidArgument
 	}
 
 	if err := r.Target.Type.Validate(); err != nil {
@@ -1354,7 +1371,7 @@ func (r *BatchJobReplicateV1) Validate(ctx context.Context, job BatchJobRequest,
 	c, err := miniogo.NewCore(u.Host, &miniogo.Options{
 		Creds:        credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken),
 		Secure:       u.Scheme == "https",
-		Transport:    getRemoteInstanceTransport,
+		Transport:    getRemoteInstanceTransport(),
 		BucketLookup: lookupStyle(pathStyle),
 	})
 	if err != nil {
@@ -1457,7 +1474,7 @@ func (j *BatchJobRequest) load(ctx context.Context, api ObjectLayer, name string
 
 func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, err error) {
 	// TODO: support custom storage class for remote replication
-	putOpts, err = putReplicationOpts(ctx, "", objInfo)
+	putOpts, err = putReplicationOpts(ctx, "", objInfo, 0)
 	if err != nil {
 		return putOpts, err
 	}
@@ -1485,7 +1502,7 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 		jobType = string(madmin.BatchJobReplicate)
 	}
 
-	resultCh := make(chan ObjectInfo)
+	resultCh := make(chan itemOrErr[ObjectInfo])
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1497,10 +1514,14 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 
 	listResult := madmin.ListBatchJobsResult{}
 	for result := range resultCh {
+		if result.Err != nil {
+			writeErrorResponseJSON(ctx, w, toAPIError(ctx, result.Err), r.URL)
+			return
+		}
 		req := &BatchJobRequest{}
-		if err := req.load(ctx, objectAPI, result.Name); err != nil {
+		if err := req.load(ctx, objectAPI, result.Item.Name); err != nil {
 			if !errors.Is(err, errNoSuchJob) {
-				logger.LogIf(ctx, err)
+				batchLogIf(ctx, err)
 			}
 			continue
 		}
@@ -1516,7 +1537,7 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	logger.LogIf(ctx, json.NewEncoder(w).Encode(&listResult))
+	batchLogIf(ctx, json.NewEncoder(w).Encode(&listResult))
 }
 
 var errNoSuchJob = errors.New("no such job")
@@ -1539,7 +1560,7 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 	req := &BatchJobRequest{}
 	if err := req.load(ctx, objectAPI, pathJoin(batchJobPrefix, jobID)); err != nil {
 		if !errors.Is(err, errNoSuchJob) {
-			logger.LogIf(ctx, err)
+			batchLogIf(ctx, err)
 		}
 
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1548,7 +1569,7 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 
 	buf, err := yaml.Marshal(req)
 	if err != nil {
-		logger.LogIf(ctx, err)
+		batchLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -1610,7 +1631,7 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	job.ID = fmt.Sprintf("%s:%d", shortuuid.New(), GetProxyEndpointLocalIndex(globalProxyEndpoints))
+	job.ID = fmt.Sprintf("%s%s%d", shortuuid.New(), getKeySeparator(), GetProxyEndpointLocalIndex(globalProxyEndpoints))
 	job.User = user
 	job.Started = time.Now()
 
@@ -1703,21 +1724,25 @@ func newBatchJobPool(ctx context.Context, o ObjectLayer, workers int) *BatchJobP
 }
 
 func (j *BatchJobPool) resume() {
-	results := make(chan ObjectInfo, 100)
+	results := make(chan itemOrErr[ObjectInfo], 100)
 	ctx, cancel := context.WithCancel(j.ctx)
 	defer cancel()
 	if err := j.objLayer.Walk(ctx, minioMetaBucket, batchJobPrefix, results, WalkOptions{}); err != nil {
-		logger.LogIf(j.ctx, err)
+		batchLogIf(j.ctx, err)
 		return
 	}
 	for result := range results {
+		if result.Err != nil {
+			batchLogIf(j.ctx, result.Err)
+			continue
+		}
 		// ignore batch-replicate.bin and batch-rotate.bin entries
-		if strings.HasSuffix(result.Name, slashSeparator) {
+		if strings.HasSuffix(result.Item.Name, slashSeparator) {
 			continue
 		}
 		req := &BatchJobRequest{}
-		if err := req.load(ctx, j.objLayer, result.Name); err != nil {
-			logger.LogIf(ctx, err)
+		if err := req.load(ctx, j.objLayer, result.Item.Name); err != nil {
+			batchLogIf(ctx, err)
 			continue
 		}
 		_, nodeIdx := parseRequestToken(req.ID)
@@ -1726,7 +1751,7 @@ func (j *BatchJobPool) resume() {
 			continue
 		}
 		if err := j.queueJob(req); err != nil {
-			logger.LogIf(ctx, err)
+			batchLogIf(ctx, err)
 			continue
 		}
 	}
@@ -1750,7 +1775,7 @@ func (j *BatchJobPool) AddWorker() {
 				if job.Replicate.RemoteToLocal() {
 					if err := job.Replicate.StartFromSource(job.ctx, j.objLayer, *job); err != nil {
 						if !isErrBucketNotFound(err) {
-							logger.LogIf(j.ctx, err)
+							batchLogIf(j.ctx, err)
 							j.canceler(job.ID, false)
 							continue
 						}
@@ -1759,7 +1784,7 @@ func (j *BatchJobPool) AddWorker() {
 				} else {
 					if err := job.Replicate.Start(job.ctx, j.objLayer, *job); err != nil {
 						if !isErrBucketNotFound(err) {
-							logger.LogIf(j.ctx, err)
+							batchLogIf(j.ctx, err)
 							j.canceler(job.ID, false)
 							continue
 						}
@@ -1769,14 +1794,14 @@ func (j *BatchJobPool) AddWorker() {
 			case job.KeyRotate != nil:
 				if err := job.KeyRotate.Start(job.ctx, j.objLayer, *job); err != nil {
 					if !isErrBucketNotFound(err) {
-						logger.LogIf(j.ctx, err)
+						batchLogIf(j.ctx, err)
 						continue
 					}
 				}
 			case job.Expire != nil:
 				if err := job.Expire.Start(job.ctx, j.objLayer, *job); err != nil {
 					if !isErrBucketNotFound(err) {
-						logger.LogIf(j.ctx, err)
+						batchLogIf(j.ctx, err)
 						continue
 					}
 				}

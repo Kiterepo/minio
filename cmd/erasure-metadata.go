@@ -30,8 +30,7 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
@@ -268,7 +267,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 		// Continue to towards the next part.
 		partOffset -= part.Size
 	}
-	logger.LogIf(ctx, InvalidRange{})
+	internalLogIf(ctx, InvalidRange{})
 	// Offset beyond the size of the object return InvalidRange.
 	return 0, 0, InvalidRange{}
 }
@@ -276,7 +275,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
 	// with less quorum return error.
 	if quorum < 1 {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 	metaHashes := make([]string, len(metaArr))
 	h := sha256.New()
@@ -342,12 +341,17 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	}
 
 	if maxCount < quorum {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 	}
 
-	// Find the successor mod time in quorum, otherwise leave the
-	// candidate's successor modTime as found
-	succModTimeMap := make(map[time.Time]int)
+	// objProps represents properties that go beyond a single version
+	type objProps struct {
+		succModTime time.Time
+		numVersions int
+	}
+	// Find the successor mod time and numVersions in quorum, otherwise leave the
+	// candidate as found
+	otherPropsMap := make(counterMap[objProps])
 	var candidate FileInfo
 	var found bool
 	for i, hash := range metaHashes {
@@ -357,28 +361,25 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 					candidate = metaArr[i]
 					found = true
 				}
-				succModTimeMap[metaArr[i].SuccessorModTime]++
+				props := objProps{
+					succModTime: metaArr[i].SuccessorModTime,
+					numVersions: metaArr[i].NumVersions,
+				}
+				otherPropsMap[props]++
 			}
-		}
-	}
-	var succModTime time.Time
-	var smodTimeQuorum bool
-	for smodTime, count := range succModTimeMap {
-		if count >= quorum {
-			smodTimeQuorum = true
-			succModTime = smodTime
-			break
 		}
 	}
 
 	if found {
-		if smodTimeQuorum {
-			candidate.SuccessorModTime = succModTime
-			candidate.IsLatest = succModTime.IsZero()
+		// Update candidate FileInfo with succModTime and numVersions in quorum when available
+		if props, ok := otherPropsMap.GetValueWithQuorum(quorum); ok {
+			candidate.SuccessorModTime = props.succModTime
+			candidate.IsLatest = props.succModTime.IsZero()
+			candidate.NumVersions = props.numVersions
 		}
 		return candidate, nil
 	}
-	return FileInfo{}, errErasureReadQuorum
+	return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 }
 
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
@@ -404,7 +405,7 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bu
 			if fi.IsValid() {
 				return disks[index].WriteMetadata(ctx, origbucket, bucket, prefix, fi)
 			}
-			return errCorruptedFormat
+			return errFileCorrupt
 		}, index)
 	}
 
@@ -499,7 +500,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 	parities := listObjectParities(partsMetaData, errs)
 	parityBlocks := commonParity(parities, defaultParityCount)
 	if parityBlocks < 0 {
-		return -1, -1, errErasureReadQuorum
+		return -1, -1, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 
 	dataBlocks := len(partsMetaData) - parityBlocks
